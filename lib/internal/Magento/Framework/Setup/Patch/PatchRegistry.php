@@ -6,6 +6,8 @@
 
 namespace Magento\Framework\Setup\Patch;
 
+use Magento\Framework\App\ObjectManager;
+
 /**
  * Allows to read all patches through the whole system
  */
@@ -55,14 +57,24 @@ class PatchRegistry implements \IteratorAggregate
     private $cyclomaticStack = [];
 
     /**
+     * @var PatchAlias $patchAlias
+     */
+    private PatchAlias $patchAlias;
+
+    /**
      * PatchRegistry constructor.
      * @param PatchFactory $patchFactory
      * @param PatchHistory $patchHistory
+     * @param PatchAlias|null $patchAlias
      */
-    public function __construct(PatchFactory $patchFactory, PatchHistory $patchHistory)
-    {
+    public function __construct(
+        PatchFactory $patchFactory,
+        PatchHistory $patchHistory,
+        PatchAlias $patchAlias = null
+    ) {
         $this->patchFactory = $patchFactory;
         $this->patchHistory = $patchHistory;
+        $this->patchAlias = $patchAlias ?: ObjectManager::getInstance()->get(PatchAlias::class);
     }
 
     /**
@@ -75,6 +87,7 @@ class PatchRegistry implements \IteratorAggregate
         $dependencies = $patchName::getDependencies();
 
         foreach ($dependencies as $dependency) {
+            $dependency = $this->patchAlias->getFinalPatchName($dependency);
             $this->dependents[$dependency][] = $patchName;
         }
     }
@@ -87,9 +100,11 @@ class PatchRegistry implements \IteratorAggregate
      */
     public function registerPatch(string $patchName)
     {
-        if ($this->patchHistory->isApplied($patchName)) {
-            $this->appliedPatches[$patchName] = $patchName;
-            $this->registerDependents($patchName);
+        $patchToRegister = $this->patchAlias->getFinalPatchName($patchName);
+
+        if ($this->patchHistory->isApplied($patchToRegister)) {
+            $this->appliedPatches[$patchName] = $patchToRegister;
+            $this->registerDependents($patchToRegister);
             return false;
         }
 
@@ -97,8 +112,9 @@ class PatchRegistry implements \IteratorAggregate
             return $this->patches[$patchName];
         }
 
-        $this->patches[$patchName] = $patchName;
-        return $patchName;
+        $this->patches[$patchName] = $patchToRegister;
+
+        return $patchToRegister;
     }
 
     /**
@@ -156,7 +172,7 @@ class PatchRegistry implements \IteratorAggregate
             }
 
             $depInstances = array_replace($depInstances, $this->getDependencies($this->patches[$dep]));
-            $depInstances[$depInstance] = $depInstance;
+            $depInstances[$dep] = $depInstance;
         }
 
         unset($this->cyclomaticStack[$patch]);

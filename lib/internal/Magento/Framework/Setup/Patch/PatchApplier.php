@@ -12,6 +12,7 @@ use Magento\Framework\ObjectManagerInterface;
 use Magento\Framework\Phrase;
 use Magento\Framework\Setup\Exception as SetupException;
 use Magento\Framework\Setup\ModuleDataSetupInterface;
+use Magento\Framework\Setup\SchemaSetupInterface;
 
 /**
  * Apply patches per specific module
@@ -60,7 +61,7 @@ class PatchApplier
     private $patchFactory;
 
     /**
-     * @var \Magento\Framework\Setup\SetupInterface
+     * @var SchemaSetupInterface
      */
     private $schemaSetup;
 
@@ -85,6 +86,11 @@ class PatchApplier
     private $moduleList;
 
     /**
+     * @var PatchAlias $patchAlias
+     */
+    private PatchAlias $patchAlias;
+
+    /**
      * PatchApplier constructor.
      * @param PatchReader $dataPatchReader
      * @param PatchReader $schemaPatchReader
@@ -94,9 +100,10 @@ class PatchApplier
      * @param PatchHistory $patchHistory
      * @param PatchFactory $patchFactory
      * @param ObjectManagerInterface $objectManager
-     * @param \Magento\Framework\Setup\SchemaSetupInterface $schemaSetup
+     * @param SchemaSetupInterface $schemaSetup
      * @param ModuleDataSetupInterface $moduleDataSetup
      * @param ModuleList $moduleList
+     * @param PatchAlias|null $patchAlias
      * @SuppressWarnings(PHPMD.ExcessiveParameterList)
      * @SuppressWarnings(Magento.TypeDuplication)
      */
@@ -109,9 +116,10 @@ class PatchApplier
         PatchHistory $patchHistory,
         PatchFactory $patchFactory,
         ObjectManagerInterface $objectManager,
-        \Magento\Framework\Setup\SchemaSetupInterface $schemaSetup,
-        \Magento\Framework\Setup\ModuleDataSetupInterface $moduleDataSetup,
-        ModuleList $moduleList
+        SchemaSetupInterface $schemaSetup,
+        ModuleDataSetupInterface $moduleDataSetup,
+        ModuleList $moduleList,
+        PatchAlias $patchAlias = null
     ) {
         $this->patchRegistryFactory = $patchRegistryFactory;
         $this->dataPatchReader = $dataPatchReader;
@@ -124,6 +132,7 @@ class PatchApplier
         $this->objectManager = $objectManager;
         $this->patchBackwardCompatability = $patchBackwardCompatability;
         $this->moduleList = $moduleList;
+        $this->patchAlias = $patchAlias ?: $this->objectManager->get(PatchAlias::class);
     }
 
     /**
@@ -144,10 +153,8 @@ class PatchApplier
                 continue;
             }
 
-            $dataPatch = $this->objectManager->create(
-                '\\' . $dataPatch,
-                ['moduleDataSetup' => $this->moduleDataSetup]
-            );
+            $dataPatch = $this->objectManager->get("\\$dataPatch");
+
             if (!$dataPatch instanceof DataPatchInterface) {
                 throw new SetupException(
                     new Phrase("Patch %1 should implement DataPatchInterface", [get_class($dataPatch)])
@@ -200,13 +207,15 @@ class PatchApplier
         $registry = $this->patchRegistryFactory->create();
 
         //Prepare modules to read
-        if ($moduleName === null) {
-            $patchNames = [];
-            foreach ($this->moduleList->getNames() as $moduleName) {
-                $patchNames += $reader->read($moduleName);
-            }
-        } else {
-            $patchNames = $reader->read($moduleName);
+        $patchNames = ($moduleName === null) ? $this->getAllModulesPatches($patchType) : $reader->read($moduleName);
+
+        if (!$this->patchAlias->isAliasesRegisteredFor($patchType)) {
+            $fullPatchNameList = ($moduleName === null) ? $patchNames : $this->getAllModulesPatches($patchType);
+            $patchArguments = $patchType === self::DATA_PATCH
+                ? ['moduleDataSetup' => $this->moduleDataSetup]
+                : ['schemaSetup' => $this->schemaSetup];
+
+            $this->patchAlias->registerPatchAliases($fullPatchNameList, $patchType, $patchArguments);
         }
 
         foreach ($patchNames as $patchName) {
@@ -236,12 +245,13 @@ class PatchApplier
                     $this->patchHistory->fixPatch($schemaPatch);
                     continue;
                 }
-                /**
-                 * @var SchemaPatchInterface $schemaPatch
-                 */
-                $schemaPatch = $this->patchFactory->create($schemaPatch, ['schemaSetup' => $this->schemaSetup]);
+
+                $schemaPatch = $this->objectManager->get("\\$schemaPatch");
+
+                /** @var SchemaPatchInterface $schemaPatch */
                 $schemaPatch->apply();
                 $this->patchHistory->fixPatch(get_class($schemaPatch));
+
                 foreach ($schemaPatch->getAliases() as $patchAlias) {
                     if (!$this->patchHistory->isApplied($patchAlias)) {
                         $this->patchHistory->fixPatch($patchAlias);
@@ -276,16 +286,23 @@ class PatchApplier
         $adapter = $this->moduleDataSetup->getConnection();
 
         foreach ($registry->getReverseIterator() as $dataPatch) {
-            $dataPatch = $this->objectManager->create(
-                '\\' . $dataPatch,
-                ['moduleDataSetup' => $this->moduleDataSetup]
-            );
+            $dataPatch = $this->objectManager->get("\\$dataPatch");
+
             if ($dataPatch instanceof PatchRevertableInterface) {
                 try {
                     $adapter->beginTransaction();
                     /** @var PatchRevertableInterface|DataPatchInterface $dataPatch */
                     $dataPatch->revert();
                     $this->patchHistory->revertPatchFromHistory(get_class($dataPatch));
+                    foreach ($dataPatch->getAliases() as $patchAlias) {
+                        /**
+                         * Remove patch alias from the table only if there is not exist the patch with the same name.
+                         * Prevent second time applying the patch with the same name as current alias
+                         */
+                        if (!class_exists($patchAlias)) {
+                            $this->patchHistory->revertPatchFromHistory($patchAlias);
+                        }
+                    }
                     $adapter->commit();
                 } catch (\Exception $e) {
                     $adapter->rollBack();
@@ -295,5 +312,23 @@ class PatchApplier
                 }
             }
         }
+    }
+
+    /**
+     * Retrieve all modules patches by patch type
+     *
+     * @param string $patchType
+     * @return string[]
+     */
+    private function getAllModulesPatches(string $patchType): array
+    {
+        $patchNames = [];
+        $reader = $patchType === self::DATA_PATCH ? $this->dataPatchReader : $this->schemaPatchReader;
+
+        foreach ($this->moduleList->getNames() as $moduleName) {
+            $patchNames = [...$patchNames, ...$reader->read($moduleName)];
+        }
+
+        return $patchNames;
     }
 }
